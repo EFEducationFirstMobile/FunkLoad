@@ -30,6 +30,10 @@ import re
 import logging
 import gzip
 import threading
+import collections
+import websocket
+import json
+from tornwamp import messages as tw_messages
 from StringIO import StringIO
 from warnings import warn
 from socket import error as SocketError
@@ -52,6 +56,53 @@ from .utils import recording, thread_sleep, is_html, get_version, trace
 from xmlrpclib import ServerProxy
 
 _marker = []
+
+HELLO_MSG = [
+    1,
+    "abc",
+    {
+        "roles": {
+            "caller": {
+                "features": {
+                    "caller_identification": True,
+                    "progressive_call_results": True
+                }
+            },
+            "callee": {
+                "features": {
+                    "progressive_call_results": True
+                }
+            },
+            "publisher": {
+                "features": {
+                    "subscriber_blackwhite_listing": True,
+                    "publisher_exclusion": True,
+                    "publisher_identification": True
+                }
+            },
+            "subscriber": {
+                "features": {
+                    "publisher_identification": True
+                }
+            }
+        }
+    }
+]
+
+
+class WampConnection(object):
+
+    def __init__(self, url):
+        self.url = url
+        self.ws = websocket.create_connection(self.url, subprotocols=["wamp.2.json"])
+        self.ws.send(json.dumps(HELLO_MSG))
+        self.ws.recv()
+
+    def recv(self, *args, **kwargs):
+        return self.ws.recv(*args, **kwargs)
+
+    def send(self, *args, **kwargs):
+        return self.ws.send(*args, **kwargs)
 
 # ------------------------------------------------------------
 # Classes
@@ -181,6 +232,7 @@ class FunkLoadTestCase(unittest.TestCase):
         # init webunit browser (passing a fake methodName)
         self._browser = WebTestCase(methodName='log')
         self.clearContext()
+        self._next_wamp_request_id = 0
 
         #self.logd('# FunkLoadTestCase._funkload_init done')
 
@@ -490,6 +542,70 @@ class FunkLoadTestCase(unittest.TestCase):
             self.logd('Page %s not found.' % url)
             return False
         return True
+
+    @property
+    def _wamp_request_id(self):
+        self._next_wamp_request_id += 1
+        if self._next_wamp_request_id > (2**53):
+            self._next_wamp_request_id = 0
+        return self._next_wamp_request_id
+
+    def wamprpc(self, connection, method, args=None, description=None):
+        self.steps += 1
+        self.page_responses = 0
+        self.logd(
+            'WAMPRPC: {}::{}\n\tCall {}: {} ...'.format(
+                self.connection.url,
+                method,
+                self.steps,
+                description or ''
+            )
+        )
+        t_start = time.time()
+        request = tw_messages.CallMessage(
+            request_id=self._wamp_request_id,
+            procedure=method,
+            args=args
+        )
+        exception = None
+        try:
+            connection.send(request.json)
+            resp = connection.recv()
+        except Exception as e:
+            exception = e
+        else:
+            wamp_response = tw_messages.Message.from_text(resp)
+
+        t_stop = time.time()
+        t_delta = t_stop - t_start
+        self.total_time += t_delta
+
+        Response = collections.namedtuple('Response', ['url', 'code'])
+
+        url = '{}#{}'.format(self.connection.url, method)
+
+        if exception is not None or wamp_response.code == tw_messages.Code.ERROR:
+            response = Response(url=url, code=200)
+            self.step_success = False
+            self.test_status = 'Error'
+            self.logd(' Failed in %.3fs' % t_delta)
+            if exception:
+                self._log_response_error(url, 'post', description, t_start, t_stop)
+                raise exception
+            else:
+                self._log_response(response, 'post', description, t_start, t_stop, log_body=True)
+                raise self.failureException(wamp_response.error)
+        else:
+            response = Response(url=url, code=500)
+
+        self.total_pages += 1
+
+        self._log_response(response, 'post', description, t_start, t_stop)
+
+        self.sleep()
+        if wamp_response.code == tw_messages.Code.RESULT:
+            return tw_messages.ResultMessage.from_text(resp)
+        return wamp_response
 
     def xmlrpc(self, url_in, method_name, params=None, description=None):
         """Call an xml rpc method_name on url with params."""

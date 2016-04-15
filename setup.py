@@ -62,6 +62,8 @@ setup(
     # setuptools specific keywords
     install_requires = ['webunit  >= 1.3.8',
                         'docutils >= 0.3.7',
+                        'websocket-client==0.37.0',
+                        'tornwamp==1.1.0',
                         'setuptools'],
     zip_safe=True,
     package_data={'funkload': ['data/*',
